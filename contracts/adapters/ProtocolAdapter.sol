@@ -2,85 +2,56 @@
 pragma solidity >=0.7.2;
 pragma experimental ABIEncoderV2;
 
-import {
-    IProtocolAdapter,
-    OptionTerms,
-    OptionType,
-    ZeroExOrder
-} from "./IProtocolAdapter.sol";
+import {IProtocolAdapter, ProtocolAdapterTypes} from "./IProtocolAdapter.sol";
 
+/**
+ * @notice ProtocolAdapter is used to shadow IProtocolAdapter to provide functions that delegatecall's the underlying IProtocolAdapter functions.
+ */
 library ProtocolAdapter {
-    function delegateProtocolName(IProtocolAdapter adapter)
-        external
-        view
-        returns (string memory)
-    {
-        (bool success, bytes memory result) =
-            address(adapter).staticcall(
-                abi.encodeWithSignature("protocolName()")
-            );
-        require(success, "protocolName staticcall failed");
-        return abi.decode(result, (string));
-    }
-
-    function delegateNonFungible(IProtocolAdapter adapter)
-        external
-        view
-        returns (bool)
-    {
-        (bool success, bytes memory result) =
-            address(adapter).staticcall(
-                abi.encodeWithSignature("nonFungible()")
-            );
-        require(success, "nonFungible staticcall failed");
-        return abi.decode(result, (bool));
-    }
-
     function delegateOptionsExist(
         IProtocolAdapter adapter,
-        OptionTerms calldata optionTerms
+        ProtocolAdapterTypes.OptionTerms calldata optionTerms
     ) external view returns (bool) {
         (bool success, bytes memory result) =
             address(adapter).staticcall(
                 abi.encodeWithSignature(
-                    "optionsExist((address,address,address,uint256,uint256,uint8))",
+                    "optionsExist((address,address,address,uint256,uint256,uint8,address))",
                     optionTerms
                 )
             );
-        require(success, "optionsExist staticcall failed");
+        revertWhenFail(success, result);
         return abi.decode(result, (bool));
     }
 
     function delegateGetOptionsAddress(
         IProtocolAdapter adapter,
-        OptionTerms calldata optionTerms
+        ProtocolAdapterTypes.OptionTerms calldata optionTerms
     ) external view returns (address) {
         (bool success, bytes memory result) =
             address(adapter).staticcall(
                 abi.encodeWithSignature(
-                    "getOptionsAddress((address,address,address,uint256,uint256,uint8))",
+                    "getOptionsAddress((address,address,address,uint256,uint256,uint8,address))",
                     optionTerms
                 )
             );
-        require(success, getRevertMsg(result));
-        require(success, "getOptionsAddress staticcall failed");
+        revertWhenFail(success, result);
         return abi.decode(result, (address));
     }
 
     function delegatePremium(
         IProtocolAdapter adapter,
-        OptionTerms calldata optionTerms,
+        ProtocolAdapterTypes.OptionTerms calldata optionTerms,
         uint256 purchaseAmount
     ) external view returns (uint256) {
         (bool success, bytes memory result) =
             address(adapter).staticcall(
                 abi.encodeWithSignature(
-                    "premium((address,address,address,uint256,uint256,uint8),uint256)",
+                    "premium((address,address,address,uint256,uint256,uint8,address),uint256)",
                     optionTerms,
                     purchaseAmount
                 )
             );
-        require(success, "premium staticcall failed");
+        revertWhenFail(success, result);
         return abi.decode(result, (uint256));
     }
 
@@ -99,42 +70,43 @@ library ProtocolAdapter {
                     amount
                 )
             );
-        require(success, getRevertMsg(result));
-        require(success, "exerciseProfit staticcall failed");
+        revertWhenFail(success, result);
         return abi.decode(result, (uint256));
     }
 
     function delegatePurchase(
         IProtocolAdapter adapter,
-        OptionTerms calldata optionTerms,
-        uint256 purchaseAmount
+        ProtocolAdapterTypes.OptionTerms calldata optionTerms,
+        uint256 purchaseAmount,
+        uint256 maxCost
     ) external returns (uint256) {
         (bool success, bytes memory result) =
             address(adapter).delegatecall(
                 abi.encodeWithSignature(
-                    "purchase((address,address,address,uint256,uint256,uint8),uint256)",
+                    "purchase((address,address,address,uint256,uint256,uint8,address),uint256,uint256)",
                     optionTerms,
-                    purchaseAmount
+                    purchaseAmount,
+                    maxCost
                 )
             );
-        require(success, getRevertMsg(result));
+        revertWhenFail(success, result);
         return abi.decode(result, (uint256));
     }
 
     function delegatePurchaseWithZeroEx(
         IProtocolAdapter adapter,
-        OptionTerms calldata optionTerms,
-        ZeroExOrder calldata zeroExOrder
+        ProtocolAdapterTypes.OptionTerms calldata optionTerms,
+        ProtocolAdapterTypes.ZeroExOrder calldata zeroExOrder
     ) external {
         (bool success, bytes memory result) =
             address(adapter).delegatecall(
                 abi.encodeWithSignature(
-                    "purchaseWithZeroEx((address,address,address,uint256,uint256,uint8),(address,address,address,address,uint256,uint256,uint256,bytes))",
+                    "purchaseWithZeroEx((address,address,address,uint256,uint256,uint8,address),(address,address,address,address,uint256,uint256,uint256,bytes))",
                     optionTerms,
                     zeroExOrder
                 )
             );
-        require(success, getRevertMsg(result));
+        revertWhenFail(success, result);
     }
 
     function delegateExercise(
@@ -144,7 +116,7 @@ library ProtocolAdapter {
         uint256 amount,
         address recipient
     ) external {
-        (bool success, bytes memory res) =
+        (bool success, bytes memory result) =
             address(adapter).delegatecall(
                 abi.encodeWithSignature(
                     "exercise(address,uint256,uint256,address)",
@@ -154,17 +126,87 @@ library ProtocolAdapter {
                     recipient
                 )
             );
-        require(success, getRevertMsg(res));
-        require(success, "exercise delegatecall failed");
+        revertWhenFail(success, result);
+    }
+
+    function delegateClaimRewards(
+        IProtocolAdapter adapter,
+        address rewardsAddress,
+        uint256[] calldata optionIDs
+    ) external returns (uint256) {
+        (bool success, bytes memory result) =
+            address(adapter).delegatecall(
+                abi.encodeWithSignature(
+                    "claimRewards(address,uint256[])",
+                    rewardsAddress,
+                    optionIDs
+                )
+            );
+        revertWhenFail(success, result);
+        return abi.decode(result, (uint256));
+    }
+
+    function delegateRewardsClaimable(
+        IProtocolAdapter adapter,
+        address rewardsAddress,
+        uint256[] calldata optionIDs
+    ) external view returns (uint256) {
+        (bool success, bytes memory result) =
+            address(adapter).staticcall(
+                abi.encodeWithSignature(
+                    "rewardsClaimable(address,uint256[])",
+                    rewardsAddress,
+                    optionIDs
+                )
+            );
+        revertWhenFail(success, result);
+        return abi.decode(result, (uint256));
+    }
+
+    function delegateCreateShort(
+        IProtocolAdapter adapter,
+        ProtocolAdapterTypes.OptionTerms calldata optionTerms,
+        uint256 amount
+    ) external returns (uint256) {
+        (bool success, bytes memory result) =
+            address(adapter).delegatecall(
+                abi.encodeWithSignature(
+                    "createShort((address,address,address,uint256,uint256,uint8,address),uint256)",
+                    optionTerms,
+                    amount
+                )
+            );
+        revertWhenFail(success, result);
+        return abi.decode(result, (uint256));
+    }
+
+    function delegateCloseShort(IProtocolAdapter adapter)
+        external
+        returns (uint256)
+    {
+        (bool success, bytes memory result) =
+            address(adapter).delegatecall(
+                abi.encodeWithSignature("closeShort()")
+            );
+        require(success, getRevertMsg(result));
+        return abi.decode(result, (uint256));
+    }
+
+    function revertWhenFail(bool success, bytes memory returnData)
+        private
+        pure
+    {
+        if (success) return;
+        revert(getRevertMsg(returnData));
     }
 
     function getRevertMsg(bytes memory _returnData)
-        internal
+        private
         pure
         returns (string memory)
     {
         // If the _res length is less than 68, then the transaction failed silently (without a revert message)
-        if (_returnData.length < 68) return "Transaction reverted silently";
+        if (_returnData.length < 68) return "ProtocolAdapter: reverted";
 
         assembly {
             // Slice the sighash.

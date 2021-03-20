@@ -2,21 +2,19 @@
 pragma solidity >=0.7.2;
 pragma experimental ABIEncoderV2;
 
+import {
+    AggregatorV3Interface
+} from "@chainlink/contracts/src/v0.6/interfaces/AggregatorV3Interface.sol";
 import {SafeMath} from "@openzeppelin/contracts/math/SafeMath.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
-import {
-    OptionType,
-    IProtocolAdapter,
-    OptionTerms,
-    ZeroExOrder,
-    PurchaseMethod
-} from "./IProtocolAdapter.sol";
+import {IProtocolAdapter, ProtocolAdapterTypes} from "./IProtocolAdapter.sol";
 import {
     IOtokenFactory,
     OtokenInterface,
     IController,
-    OracleInterface
+    OracleInterface,
+    GammaTypes
 } from "../interfaces/GammaInterface.sol";
 import {IWETH} from "../interfaces/IWETH.sol";
 import {IUniswapV2Router02} from "../interfaces/IUniswapV2Router.sol";
@@ -26,31 +24,71 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
-    address public immutable zeroExExchange;
+    // gammaController is the top-level contract in Gamma protocol which allows users to perform multiple actions on their vaults and positions https://github.com/opynfinance/GammaProtocol/blob/master/contracts/Controller.sol
     address public immutable gammaController;
+
+    // oTokenFactory is the factory contract used to spawn otokens. Used to lookup otokens.
     address public immutable oTokenFactory;
-    address private immutable _weth;
-    address private immutable _router;
-    uint256 private constant _swapWindow = 900;
+
+    // _swapWindow is the number of seconds in which a Uniswap swap is valid from block.timestamp.
+    uint256 private constant SWAP_WINDOW = 900;
 
     string private constant _name = "OPYN_GAMMA";
     bool private constant _nonFungible = false;
-    address private constant _marginPool =
-        0x5934807cC0654d46755eBd2848840b616256C6Ef;
+
+    // https://github.com/opynfinance/GammaProtocol/blob/master/contracts/Otoken.sol#L70
     uint256 private constant OTOKEN_DECIMALS = 10**8;
 
+    // MARGIN_POOL is Gamma protocol's collateral pool. Needed to approve collateral.safeTransferFrom for minting otokens. https://github.com/opynfinance/GammaProtocol/blob/master/contracts/MarginPool.sol
+    address public immutable MARGIN_POOL;
+
+    // USDCETHPriceFeed is the USDC/ETH Chainlink price feed used to perform swaps, as an alternative to getAmountsIn
+    AggregatorV3Interface public immutable USDCETHPriceFeed;
+
+    // UNISWAP_ROUTER is Uniswap's periphery contract for conducting trades. Using this contract is gas inefficient and should only used for convenience i.e. admin functions
+    address public immutable UNISWAP_ROUTER;
+
+    // WETH9 contract
+    address public immutable WETH;
+
+    // USDC is the strike asset in Gamma Protocol
+    address public immutable USDC;
+
+    // 0x proxy for performing buys
+    address public immutable ZERO_EX_EXCHANGE_V3;
+
+    /**
+     * @notice Constructor for the GammaAdapter which initializes a few immutable variables to be used by instrument contracts.
+     * @param _oTokenFactory is the Gamma protocol factory contract which spawns otokens https://github.com/opynfinance/GammaProtocol/blob/master/contracts/OtokenFactory.sol
+     * @param _gammaController is a top-level contract which allows users to perform multiple actions in the Gamma protocol https://github.com/opynfinance/GammaProtocol/blob/master/contracts/Controller.sol
+     */
     constructor(
         address _oTokenFactory,
         address _gammaController,
-        address weth,
-        address _zeroExExchange,
-        address router
+        address _marginPool,
+        address _usdcEthPriceFeed,
+        address _uniswapRouter,
+        address _weth,
+        address _usdc,
+        address _zeroExExchange
     ) {
+        require(_oTokenFactory != address(0), "!_oTokenFactory");
+        require(_gammaController != address(0), "!_gammaController");
+        require(_marginPool != address(0), "!_marginPool");
+        require(_usdcEthPriceFeed != address(0), "!_usdcEthPriceFeed");
+        require(_uniswapRouter != address(0), "!_uniswapRouter");
+        require(_weth != address(0), "!_weth");
+        require(_usdc != address(0), "!_usdc");
+        require(_zeroExExchange != address(0), "!_zeroExExchange");
+
         oTokenFactory = _oTokenFactory;
-        zeroExExchange = _zeroExExchange;
         gammaController = _gammaController;
-        _weth = weth;
-        _router = router;
+        MARGIN_POOL = _marginPool;
+        USDCETHPriceFeed = AggregatorV3Interface(_usdcEthPriceFeed);
+        UNISWAP_ROUTER = _uniswapRouter;
+        WETH = _weth;
+        USDC = _usdc;
+        ZERO_EX_EXCHANGE_V3 = _zeroExExchange;
     }
 
     receive() external payable {}
@@ -63,15 +101,20 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
         return _nonFungible;
     }
 
-    function purchaseMethod() external pure override returns (PurchaseMethod) {
-        return PurchaseMethod.ZeroEx;
+    function purchaseMethod()
+        external
+        pure
+        override
+        returns (ProtocolAdapterTypes.PurchaseMethod)
+    {
+        return ProtocolAdapterTypes.PurchaseMethod.ZeroEx;
     }
 
     /**
      * @notice Check if an options contract exist based on the passed parameters.
      * @param optionTerms is the terms of the option contract
      */
-    function optionsExist(OptionTerms calldata optionTerms)
+    function optionsExist(ProtocolAdapterTypes.OptionTerms calldata optionTerms)
         external
         view
         override
@@ -84,21 +127,16 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
      * @notice Get the options contract's address based on the passed parameters
      * @param optionTerms is the terms of the option contract
      */
-    function getOptionsAddress(OptionTerms calldata optionTerms)
-        external
-        view
-        override
-        returns (address)
-    {
+    function getOptionsAddress(
+        ProtocolAdapterTypes.OptionTerms calldata optionTerms
+    ) external view override returns (address) {
         return lookupOToken(optionTerms);
     }
 
     /**
      * @notice Gets the premium to buy `purchaseAmount` of the option contract in ETH terms.
-     * @param optionTerms is the terms of the option contract
-     * @param purchaseAmount is the purchase amount in Wad units (10**18)
      */
-    function premium(OptionTerms calldata optionTerms, uint256 purchaseAmount)
+    function premium(ProtocolAdapterTypes.OptionTerms calldata, uint256)
         external
         pure
         override
@@ -108,24 +146,18 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
     }
 
     /**
-     * @notice Amount of profit made from exercising an option contract (current price - strike price). 0 if exercising out-the-money.
+     * @notice Amount of profit made from exercising an option contract abs(current price - strike price). 0 if exercising out-the-money.
      * @param options is the address of the options contract
-     * @param optionID is the ID of the option position in non fungible protocols like Hegic.
      * @param amount is the amount of tokens or options contract to exercise. Only relevant for fungle protocols like Opyn
      */
     function exerciseProfit(
         address options,
-        uint256 optionID,
+        uint256,
         uint256 amount
     ) public view override returns (uint256 profit) {
         IController controller = IController(gammaController);
         OracleInterface oracle = OracleInterface(controller.oracle());
         OtokenInterface otoken = OtokenInterface(options);
-
-        require(
-            block.timestamp >= otoken.expiryTimestamp(),
-            "oToken not expired yet"
-        );
 
         uint256 spotPrice = oracle.getPrice(otoken.underlyingAsset());
         uint256 strikePrice = otoken.strikePrice();
@@ -140,61 +172,70 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
         return controller.getPayout(options, amount.div(10**10));
     }
 
+    /**
+     * @notice Helper function that returns true if the option can be exercised now.
+     * @param options is the address of the otoken
+     * @param amount is amount of otokens to exercise
+     */
     function canExercise(
         address options,
-        uint256 optionID,
+        uint256,
         uint256 amount
     ) public view override returns (bool) {
         OtokenInterface otoken = OtokenInterface(options);
 
-        if (block.timestamp < otoken.expiryTimestamp()) {
+        address underlying = otoken.underlyingAsset();
+        uint256 expiry = otoken.expiryTimestamp();
+
+        if (!isSettlementAllowed(underlying, expiry)) {
             return false;
         }
-        if (exerciseProfit(options, optionID, amount) > 0) {
+        // use `0` as the optionID because it doesn't do anything for exerciseProfit
+        if (exerciseProfit(options, 0, amount) > 0) {
             return true;
         }
         return false;
     }
 
     /**
-     * @notice Purchases the options contract.
-     * @param optionTerms is the terms of the option contract
-     * @param amount is the purchase amount in Wad units (10**18)
+     * @notice Stubbed out for conforming to the IProtocolAdapter interface.
      */
-    function purchase(OptionTerms calldata optionTerms, uint256 amount)
-        external
-        payable
-        override
-        returns (uint256 optionID)
-    {}
+    function purchase(
+        ProtocolAdapterTypes.OptionTerms calldata,
+        uint256,
+        uint256
+    ) external payable override returns (uint256) {}
 
+    /**
+     * @notice Purchases otokens using a 0x order struct
+     * @param optionTerms is the terms of the option contract
+     * @param zeroExOrder is the 0x order struct constructed using the 0x API response passed by the frontend.
+     */
     function purchaseWithZeroEx(
-        OptionTerms calldata optionTerms,
-        ZeroExOrder calldata zeroExOrder
+        ProtocolAdapterTypes.OptionTerms calldata optionTerms,
+        ProtocolAdapterTypes.ZeroExOrder calldata zeroExOrder
     ) external payable {
         require(
             msg.value >= zeroExOrder.protocolFee,
             "Value cannot cover protocolFee"
         );
 
-        IUniswapV2Router02 router = IUniswapV2Router02(_router);
+        IUniswapV2Router02 router = IUniswapV2Router02(UNISWAP_ROUTER);
 
         address[] memory path = new address[](2);
-        path[0] = _weth;
+        path[0] = WETH;
         path[1] = zeroExOrder.sellTokenAddress;
-        uint256[] memory amountsIn =
-            router.getAmountsIn(zeroExOrder.takerAssetAmount, path);
 
-        uint256 soldETH = amountsIn[0];
-        uint256 totalCost = soldETH.add(zeroExOrder.protocolFee);
+        (, int256 latestPrice, , , ) = USDCETHPriceFeed.latestRoundData();
 
-        require(msg.value >= totalCost, "Not enough value to purchase");
+        uint256 soldETH =
+            zeroExOrder.takerAssetAmount.mul(uint256(latestPrice)).div(10**6);
 
         router.swapETHForExactTokens{value: soldETH}(
             zeroExOrder.takerAssetAmount,
             path,
             address(this),
-            block.timestamp + _swapWindow
+            block.timestamp + SWAP_WINDOW
         );
 
         require(
@@ -214,7 +255,7 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
         );
 
         (bool success, ) =
-            zeroExOrder.exchangeAddress.call{value: zeroExOrder.protocolFee}(
+            ZERO_EX_EXCHANGE_V3.call{value: zeroExOrder.protocolFee}(
                 zeroExOrder.swapData
             );
 
@@ -230,12 +271,7 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
             msg.sender,
             _name,
             optionTerms.underlying,
-            optionTerms.strikeAsset,
-            optionTerms.expiry,
-            optionTerms.strikePrice,
-            optionTerms.optionType,
-            zeroExOrder.makerAssetAmount,
-            totalCost,
+            soldETH.add(zeroExOrder.protocolFee),
             0
         );
     }
@@ -243,13 +279,12 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
     /**
      * @notice Exercises the options contract.
      * @param options is the address of the options contract
-     * @param optionID is the ID of the option position in non fungible protocols like Hegic.
      * @param amount is the amount of tokens or options contract to exercise. Only relevant for fungle protocols like Opyn
      * @param recipient is the account that receives the exercised profits. This is needed since the adapter holds all the positions and the msg.sender is an instrument contract.
      */
     function exercise(
         address options,
-        uint256 optionID,
+        uint256,
         uint256 amount,
         address recipient
     ) public payable override {
@@ -260,8 +295,12 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
             "oToken not expired yet"
         );
 
+        // Since we accept all amounts in 10**18, we need to normalize it down to the decimals otokens use (10**8)
         uint256 scaledAmount = amount.div(10**10);
-        uint256 profit = exerciseProfit(options, optionID, amount);
+
+        // use `0` as the optionID because it doesn't do anything for exerciseProfit
+        uint256 profit = exerciseProfit(options, 0, amount);
+
         require(profit > 0, "Not profitable to exercise");
 
         IController.ActionArgs memory action =
@@ -285,15 +324,17 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
         uint256 profitInUnderlying =
             swapExercisedProfitsToUnderlying(options, profit, recipient);
 
-        emit Exercised(
-            msg.sender,
-            options,
-            optionID,
-            amount,
-            profitInUnderlying
-        );
+        emit Exercised(msg.sender, options, 0, amount, profitInUnderlying);
     }
 
+    /**
+     * @notice Swaps the exercised profit (originally in the collateral token) into the `underlying` token.
+     *         This simplifies the payout of an option. Put options pay out in USDC, so we swap USDC back
+     *         into WETH and transfer it to the recipient.
+     * @param otokenAddress is the otoken's address
+     * @param profitInCollateral is the profit after exercising denominated in the collateral - this could be a token with different decimals
+     * @param recipient is the recipient of the underlying tokens after the swap
+     */
     function swapExercisedProfitsToUnderlying(
         address otokenAddress,
         uint256 profitInCollateral,
@@ -308,9 +349,9 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
             "Not enough collateral from exercising"
         );
 
-        IUniswapV2Router02 router = IUniswapV2Router02(_router);
+        IUniswapV2Router02 router = IUniswapV2Router02(UNISWAP_ROUTER);
 
-        IWETH weth = IWETH(_weth);
+        IWETH weth = IWETH(WETH);
 
         if (collateral == address(weth)) {
             profitInUnderlying = profitInCollateral;
@@ -332,15 +373,21 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
                 profitInUnderlying,
                 path,
                 recipient,
-                block.timestamp + _swapWindow
+                block.timestamp + SWAP_WINDOW
             );
         }
     }
 
+    /**
+     * @notice Creates a short otoken position by opening a vault, depositing collateral and minting otokens.
+     * The sale of otokens is left to the caller contract to perform.
+     * @param optionTerms is the terms of the option contract
+     * @param depositAmount is the amount deposited to open the vault. This amount will determine how much otokens to mint.
+     */
     function createShort(
-        OptionTerms calldata optionTerms,
+        ProtocolAdapterTypes.OptionTerms calldata optionTerms,
         uint256 depositAmount
-    ) external payable override {
+    ) external override returns (uint256) {
         IController controller = IController(gammaController);
         uint256 newVaultID =
             (controller.getAccountVaultCounter(address(this))).add(1);
@@ -350,14 +397,14 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
 
         address collateralAsset = optionTerms.collateralAsset;
         if (collateralAsset == address(0)) {
-            collateralAsset = _weth;
+            collateralAsset = WETH;
         }
         IERC20 collateralToken = IERC20(collateralAsset);
 
         uint256 collateralDecimals = assetDecimals(collateralAsset);
         uint256 mintAmount;
 
-        if (optionTerms.optionType == OptionType.Call) {
+        if (optionTerms.optionType == ProtocolAdapterTypes.OptionType.Call) {
             mintAmount = depositAmount;
             if (collateralDecimals >= 8) {
                 uint256 scaleBy = 10**(collateralDecimals - 8); // oTokens have 8 decimals
@@ -373,7 +420,7 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
                 .div(10**collateralDecimals);
         }
 
-        collateralToken.safeApprove(_marginPool, depositAmount);
+        collateralToken.safeApprove(MARGIN_POOL, depositAmount);
 
         IController.ActionArgs[] memory actions =
             new IController.ActionArgs[](3);
@@ -412,11 +459,128 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
         );
 
         controller.operate(actions);
+
+        return mintAmount;
     }
 
-    function assetDecimals(address asset) private pure returns (uint256) {
+    /**
+     * @notice Close the existing short otoken position. Currently this implementation is simple.
+     * It closes the most recent vault opened by the contract. This assumes that the contract will
+     * only have a single vault open at any given time. Since calling `closeShort` deletes vaults,
+     * this assumption should hold.
+     */
+    function closeShort() external override returns (uint256) {
+        IController controller = IController(gammaController);
+
+        // gets the currently active vault ID
+        uint256 vaultID = controller.getAccountVaultCounter(address(this));
+
+        GammaTypes.Vault memory vault =
+            controller.getVault(address(this), vaultID);
+
+        require(vault.shortOtokens.length > 0, "No active short");
+
+        IERC20 collateralToken = IERC20(vault.collateralAssets[0]);
+        OtokenInterface otoken = OtokenInterface(vault.shortOtokens[0]);
+
+        bool settlementAllowed =
+            isSettlementAllowed(
+                otoken.underlyingAsset(),
+                otoken.expiryTimestamp()
+            );
+
+        uint256 startCollateralBalance =
+            collateralToken.balanceOf(address(this));
+
+        IController.ActionArgs[] memory actions;
+
+        // If it is after expiry, we need to settle the short position using the normal way
+        // Delete the vault and withdraw all remaining collateral from the vault
+        //
+        // If it is before expiry, we need to burn otokens in order to withdraw collateral from the vault
+        if (settlementAllowed) {
+            actions = new IController.ActionArgs[](1);
+
+            actions[0] = IController.ActionArgs(
+                IController.ActionType.SettleVault,
+                address(this), // owner
+                address(this), // address to transfer to
+                address(0), // not used
+                vaultID, // vaultId
+                0, // not used
+                0, // not used
+                "" // not used
+            );
+
+            controller.operate(actions);
+        } else {
+            // Burning otokens given by vault.shortAmounts[0] (closing the entire short position),
+            // then withdrawing all the collateral from the vault
+            actions = new IController.ActionArgs[](2);
+
+            actions[0] = IController.ActionArgs(
+                IController.ActionType.BurnShortOption,
+                address(this), // owner
+                address(this), // address to transfer to
+                address(otoken), // otoken address
+                vaultID, // vaultId
+                vault.shortAmounts[0], // amount
+                0, //index
+                "" //data
+            );
+
+            actions[1] = IController.ActionArgs(
+                IController.ActionType.WithdrawCollateral,
+                address(this), // owner
+                address(this), // address to transfer to
+                address(collateralToken), // withdrawn asset
+                vaultID, // vaultId
+                vault.collateralAmounts[0], // amount
+                0, //index
+                "" //data
+            );
+
+            controller.operate(actions);
+        }
+
+        uint256 endCollateralBalance = collateralToken.balanceOf(address(this));
+
+        return endCollateralBalance.sub(startCollateralBalance);
+    }
+
+    /**
+     * @notice Gas-optimized getter for checking if settlement is allowed. Looks up from the oracles with asset address and expiry
+     * @param underlying is the address of the underlying for an otoken
+     * @param expiry is the timestamp of the otoken's expiry
+     */
+    function isSettlementAllowed(address underlying, uint256 expiry)
+        private
+        view
+        returns (bool)
+    {
+        IController controller = IController(gammaController);
+        OracleInterface oracle = OracleInterface(controller.oracle());
+
+        bool underlyingFinalized =
+            oracle.isDisputePeriodOver(underlying, expiry);
+
+        bool strikeFinalized = oracle.isDisputePeriodOver(USDC, expiry);
+
+        // We can avoid checking the dispute period for the collateral for now
+        // Because the collateral is either the underlying or USDC at this point
+        // We do not have, for example, ETH-collateralized UNI otoken vaults
+        // bool collateralFinalized = oracle.isDisputePeriodOver(isPut ? USDC : underlying, expiry);
+
+        return underlyingFinalized && strikeFinalized;
+    }
+
+    /**
+     * @notice Helper function to get the decimals of an asset. Will just hardcode for the time being.
+     * @param asset is the token which we want to know the decimals
+     */
+    function assetDecimals(address asset) private view returns (uint256) {
         // USDC
-        if (asset == 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48) {
+        if (asset == USDC) {
             return 6;
         }
         return 18;
@@ -426,25 +590,30 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
      * @notice Function to lookup oToken addresses. oToken addresses are keyed by an ABI-encoded byte string
      * @param optionTerms is the terms of the option contract
      */
-    function lookupOToken(OptionTerms memory optionTerms)
+    function lookupOToken(ProtocolAdapterTypes.OptionTerms memory optionTerms)
         public
         view
         returns (address oToken)
     {
         IOtokenFactory factory = IOtokenFactory(oTokenFactory);
 
-        bool isPut = optionTerms.optionType == OptionType.Put;
+        bool isPut =
+            optionTerms.optionType == ProtocolAdapterTypes.OptionType.Put;
         address underlying = optionTerms.underlying;
 
+        /**
+         * In many instances, we just use 0x0 to indicate ETH as the underlying asset.
+         * We need to unify usage of 0x0 as WETH instead.
+         */
         if (optionTerms.underlying == address(0)) {
-            underlying = _weth;
+            underlying = WETH;
         }
 
         // Put otokens have USDC as the backing collateral
         // so we can ignore the collateral asset passed in option terms
         address collateralAsset;
         if (isPut) {
-            collateralAsset = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+            collateralAsset = USDC;
         } else {
             collateralAsset = underlying;
         }
