@@ -13,18 +13,16 @@ import {
 
 import {IRibbonFactory} from "../interfaces/IRibbonFactory.sol";
 
-contract OptionsVaultStorageV0 {
-    // Gap just in case we push storage in front of the OptionsVaultStorage contract
-    uint256[50] private __gap;
-}
-
 contract OptionsVaultStorageV1 is
     ReentrancyGuardUpgradeable,
     OwnableUpgradeable,
     ERC20Upgradeable
 {
-    // Asset for which we create a covered call for
-    address public asset;
+    // DEPRECATED: This variable was originally used to store the asset address we are using as collateral
+    // But due to gas optimization and upgradeability security concerns,
+    // we removed it in favor of using immutable variables
+    // This variable is left here to hold the storage slot for upgrades
+    address private _oldAsset;
 
     // Privileged role that is able to select the option terms (strike price, expiry) to short
     address public manager;
@@ -45,7 +43,7 @@ contract OptionsVaultStorageV1 is
     uint256 public cap;
 
     // Fee incurred when withdrawing out of the vault, in the units of 10**18
-    // where 1 ether = 100%, so 0.005 means 0.005% fee
+    // where 1 ether = 100%, so 0.005 means 0.5% fee
     uint256 public instantWithdrawalFee;
 
     // Recipient for withdrawal fees
