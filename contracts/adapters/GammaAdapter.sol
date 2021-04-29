@@ -19,6 +19,7 @@ import {
 import {IWETH} from "../interfaces/IWETH.sol";
 import {IUniswapV2Router02} from "../interfaces/IUniswapV2Router.sol";
 import {DSMath} from "../lib/DSMath.sol";
+import {IERC20Detailed} from "../interfaces/IERC20Detailed.sol";
 
 contract GammaAdapter is IProtocolAdapter, DSMath {
     using SafeMath for uint256;
@@ -431,13 +432,15 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
         }
         IERC20 collateralToken = IERC20(collateralAsset);
 
-        uint256 collateralDecimals = assetDecimals(collateralAsset);
+        uint256 collateralDecimals =
+            uint256(IERC20Detailed(collateralAsset).decimals());
         uint256 mintAmount;
 
         if (optionTerms.optionType == ProtocolAdapterTypes.OptionType.Call) {
             mintAmount = depositAmount;
-            if (collateralDecimals >= 8) {
-                uint256 scaleBy = 10**(collateralDecimals - 8); // oTokens have 8 decimals
+            uint256 scaleBy = 10**(collateralDecimals.sub(8)); // oTokens have 8 decimals
+
+            if (mintAmount > scaleBy && collateralDecimals > 8) {
                 mintAmount = depositAmount.div(scaleBy); // scale down from 10**18 to 10**8
                 require(
                     mintAmount > 0,
@@ -445,8 +448,25 @@ contract GammaAdapter is IProtocolAdapter, DSMath {
                 );
             }
         } else {
-            mintAmount = wdiv(depositAmount, optionTerms.strikePrice)
-                .mul(OTOKEN_DECIMALS)
+            // For minting puts, there will be instances where the full depositAmount will not be used for minting.
+            // This is because of an issue with precision.
+            //
+            // For ETH put options, we are calculating the mintAmount (10**8 decimals) using
+            // the depositAmount (10**18 decimals), which will result in truncation of decimals when scaling down.
+            // As a result, there will be tiny amounts of dust left behind in the Opyn vault when minting put otokens.
+            //
+            // For simplicity's sake, we do not refund the dust back to the address(this) on minting otokens.
+            // We retain the dust in the vault so the calling contract can withdraw the
+            // actual locked amount + dust at settlement.
+            //
+            // To test this behavior, we can console.log
+            // MarginCalculatorInterface(0x7A48d10f372b3D7c60f6c9770B91398e4ccfd3C7).getExcessCollateral(vault)
+            // to see how much dust (or excess collateral) is left behind.
+            mintAmount = wdiv(
+                depositAmount.mul(OTOKEN_DECIMALS),
+                optionTerms
+                    .strikePrice
+            )
                 .div(10**collateralDecimals);
         }
 
