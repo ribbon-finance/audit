@@ -33,7 +33,8 @@ contract RibbonThetaVault is DSMath, OptionsVaultStorage {
     bool public immutable isPut;
     uint8 private immutable _decimals;
 
-    // AirSwap Swap contract https://github.com/airswap/airswap-protocols/blob/master/source/swap/contracts/interfaces/ISwap.sol
+    // AirSwap Swap contract
+    // https://github.com/airswap/airswap-protocols/blob/master/source/swap/contracts/interfaces/ISwap.sol
     ISwap public immutable SWAP_CONTRACT;
 
     // 90% locked in options protocol, 10% of the pool reserved for withdrawals
@@ -69,6 +70,10 @@ contract RibbonThetaVault is DSMath, OptionsVaultStorage {
     event WithdrawalFeeSet(uint256 oldFee, uint256 newFee);
 
     event CapSet(uint256 oldCap, uint256 newCap, address manager);
+
+    event ScheduleWithdraw(address account, uint256 shares);
+
+    event ScheduledWithdrawCompleted(address account, uint256 amount);
 
     /**
      * @notice Initializes the contract with immutable variables
@@ -223,7 +228,9 @@ contract RibbonThetaVault is DSMath, OptionsVaultStorage {
 
         uint256 shareSupply = totalSupply();
 
-        // Following the pool share calculation from Alpha Homora: https://github.com/AlphaFinanceLab/alphahomora/blob/340653c8ac1e9b4f23d5b81e61307bf7d02a26e8/contracts/5/Bank.sol#L104
+        // Following the pool share calculation from Alpha Homora:
+        // solhint-disable-next-line
+        // https://github.com/AlphaFinanceLab/alphahomora/blob/340653c8ac1e9b4f23d5b81e61307bf7d02a26e8/contracts/5/Bank.sol#L104
         uint256 share =
             shareSupply == 0 ? amount : amount.mul(shareSupply).div(total);
 
@@ -276,7 +283,53 @@ contract RibbonThetaVault is DSMath, OptionsVaultStorage {
     }
 
     /**
-     * @notice Sets the next option the vault will be shorting, and closes the existing short. This allows all the users to withdraw if the next option is malicious.
+     * @notice Lock's users shares for future withdraw and ensures that the new short excludes the scheduled amount.
+     * @param shares is the number of shares to be withdrawn in the future.
+     */
+    function withdrawLater(uint256 shares) external nonReentrant {
+        require(shares > 0, "!shares");
+        require(
+            scheduledWithdrawals[msg.sender] == 0,
+            "Scheduled withdrawal already exists"
+        );
+
+        emit ScheduleWithdraw(msg.sender, shares);
+
+        scheduledWithdrawals[msg.sender] = shares;
+        queuedWithdrawShares = queuedWithdrawShares.add(shares);
+        _transfer(msg.sender, address(this), shares);
+    }
+
+    /**
+     * @notice Burns user's locked tokens and withdraws assets to msg.sender.
+     */
+    function completeScheduledWithdrawal() external nonReentrant {
+        uint256 withdrawShares = scheduledWithdrawals[msg.sender];
+        require(withdrawShares > 0, "Scheduled withdrawal not found");
+
+        scheduledWithdrawals[msg.sender] = 0;
+        queuedWithdrawShares = queuedWithdrawShares.sub(withdrawShares);
+
+        (uint256 amountAfterFee, uint256 feeAmount) =
+            withdrawAmountWithShares(withdrawShares);
+
+        emit Withdraw(msg.sender, amountAfterFee, withdrawShares, feeAmount);
+        emit ScheduledWithdrawCompleted(msg.sender, amountAfterFee);
+
+        _burn(address(this), withdrawShares);
+        IERC20(asset).safeTransfer(feeRecipient, feeAmount);
+        if (asset == WETH) {
+            IWETH(WETH).withdraw(amountAfterFee);
+            (bool success, ) = msg.sender.call{value: amountAfterFee}("");
+            require(success, "ETH transfer failed");
+        } else {
+            IERC20(asset).safeTransfer(msg.sender, amountAfterFee);
+        }
+    }
+
+    /**
+     * @notice Sets the next option the vault will be shorting, and closes the existing short.
+     *         This allows all the users to withdraw if the next option is malicious.
      */
     function commitAndClose(
         ProtocolAdapterTypes.OptionTerms calldata optionTerms
@@ -290,7 +343,8 @@ contract RibbonThetaVault is DSMath, OptionsVaultStorage {
     }
 
     /**
-     * @notice Sets the next option address and the timestamp at which the admin can call `rollToNextOption` to open a short for the option.
+     * @notice Sets the next option address and the timestamp at which the
+     * admin can call `rollToNextOption` to open a short for the option.
      * @param optionTerms is the terms of the option contract
      */
     function _setNextOption(
@@ -312,8 +366,14 @@ contract RibbonThetaVault is DSMath, OptionsVaultStorage {
         require(option != address(0), "!option");
         OtokenInterface otoken = OtokenInterface(option);
         require(otoken.isPut() == isPut, "Option type does not match");
-        require(otoken.underlyingAsset() == underlying, "!asset");
-        require(otoken.strikeAsset() == USDC, "strikeAsset != USDC"); // we just assume all options use USDC as the strike
+        require(
+            otoken.underlyingAsset() == underlying,
+            "Wrong underlyingAsset"
+        );
+        require(otoken.collateralAsset() == asset, "Wrong collateralAsset");
+
+        // we just assume all options use USDC as the strike
+        require(otoken.strikeAsset() == USDC, "strikeAsset != USDC");
 
         uint256 readyAt = block.timestamp.add(delay);
         require(
@@ -359,8 +419,11 @@ contract RibbonThetaVault is DSMath, OptionsVaultStorage {
         currentOption = newOption;
         nextOption = address(0);
 
-        uint256 currentBalance = IERC20(asset).balanceOf(address(this));
-        uint256 shortAmount = wmul(currentBalance, lockedRatio);
+        uint256 currentBalance = assetBalance();
+        (uint256 queuedWithdrawAmount, , ) =
+            _withdrawAmountWithShares(queuedWithdrawShares, currentBalance);
+        uint256 freeBalance = currentBalance.sub(queuedWithdrawAmount);
+        uint256 shortAmount = wmul(freeBalance, lockedRatio);
         lockedAmount = shortAmount;
 
         OtokenInterface otoken = OtokenInterface(newOption);
@@ -496,6 +559,7 @@ contract RibbonThetaVault is DSMath, OptionsVaultStorage {
 
         uint256 shareSupply = totalSupply();
 
+        // solhint-disable-next-line
         // Following the pool share calculation from Alpha Homora: https://github.com/AlphaFinanceLab/alphahomora/blob/340653c8ac1e9b4f23d5b81e61307bf7d02a26e8/contracts/5/Bank.sol#L111
         withdrawAmount = share.mul(total).div(shareSupply);
         newAssetBalance = total.sub(withdrawAmount);
@@ -509,9 +573,11 @@ contract RibbonThetaVault is DSMath, OptionsVaultStorage {
         uint256 withdrawableBalance = assetBalance();
         uint256 total = lockedAmount.add(withdrawableBalance);
         return
-            withdrawableBalance.mul(totalSupply()).div(total).sub(
-                MINIMUM_SUPPLY
-            );
+            withdrawableBalance
+                .mul(totalSupply())
+                .div(total)
+                .sub(MINIMUM_SUPPLY)
+                .sub(queuedWithdrawShares);
     }
 
     /**
@@ -528,12 +594,15 @@ contract RibbonThetaVault is DSMath, OptionsVaultStorage {
         uint256 share = balanceOf(account);
         uint256 numShares = min(maxShares, share);
 
-        (uint256 withdrawAmount, ) = withdrawAmountWithShares(numShares);
+        (uint256 withdrawAmount, , ) =
+            _withdrawAmountWithShares(numShares, assetBalance());
+
         return withdrawAmount;
     }
 
     /**
-     * @notice Returns the number of shares for a given `assetAmount`. Used by the frontend to calculate withdraw amounts.
+     * @notice Returns the number of shares for a given `assetAmount`.
+     *         Used by the frontend to calculate withdraw amounts.
      * @param assetAmount is the asset amount to be withdrawn
      * @return share amount
      */
